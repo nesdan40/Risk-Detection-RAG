@@ -863,10 +863,12 @@ def main(
 
         # D3: Last resort — the company's own rating disclosed in its annual reports,
         # only for companies that got no credit row from D1 or D2.
+        # only rows that carry a long-term rating count (reference-only letters do not)
         companies_with_credit = set(session.scalars(
             select(ExtractedFeature.company_id).where(
                 ExtractedFeature.company_id.in_(company_ids),
                 ExtractedFeature.feature_type == "credit",
+                ExtractedFeature.credit_rating.is_not(None),
             )
         ))
         for doc in financial_docs:

@@ -81,8 +81,14 @@ RATING_RE = re.compile(
     + r"(?:\s*\((?:SO|CE|Triple[^)]{0,20}|Pronounced[^)]{0,30})\))?"
     + r"(?:\s*[/(,;]\s*(?P<outlook>Stable|Negative|Positive|RWN|RWP|Rating\s+Watch[^)\s,;]*|Watch\w*|CreditWatch\w*)\)?)?"
 )
-# Short-term symbols after an agency name, e.g. "ICRA A1+", "CARE A4"
-SHORT_RE = re.compile(_AGENCY + r"[\s\-:]{0,3}(?P<st>A[1-4]\+?|P[1-4]\+?|PR[1-4]\+?)(?![A-Za-z0-9])")
+# Short-term symbols after an agency name, e.g. "ICRA A1+", "CARE A4"; OCR reads the 1 as l / I
+# ("CRISIL Al+"), normalised by _short_term()
+SHORT_RE = re.compile(_AGENCY + r"[\s\-:]{0,3}(?P<st>A[1-4lI]\+?|P[1-4]\+?|PR[1-4]\+?)(?![A-Za-z0-9])")
+# Fixed-deposit / medium-term scale: "BWR FAAA", "CRISIL FAA+", "ICRA MAA-"
+DEPOSIT_RE = re.compile(_AGENCY + r"[\s\-:]{0,3}(?P<scale>[FM])(?P<rating>AAA|AA|A|BBB|BB|B|C|D)(?:\s?(?P<sign>[+\-]))?(?![A-Za-z0-9])")
+WATCH_RE = re.compile(r"watch\s+with\s+(negative|positive|developing)\s+implications|rating\s+watch\s+(negative|positive)", re.I)
+_LETTER_AGENCY = re.compile(r"\b(ICRA|CRISIL|CARE|BRICKWORK|Brickwork|ACUITE|SMERA|INFOMERICS|India Ratings)\b")
+WITHDRAWN_RE = re.compile(r"rating\s+withdrawn|withdrawn\s+(?:the|its)\s+rating|withdrawal\s+of\s+(?:the\s+)?rating", re.I)
 
 OUTLOOK_WORD = re.compile(r"\b(Stable|Negative|Positive)\s+outlook\b|\boutlook\s*(?:is|of|as)?\s*[:\-]?\s*(Stable|Negative|Positive)\b", re.I)
 REVISION_RE = re.compile(r"\b(downgrad\w*|upgrad\w*|revis\w+|lowered|revised)\b", re.I)
@@ -101,7 +107,7 @@ def _norm_outlook(raw: str | None) -> str | None:
 
 def _agency_name(raw: str) -> str:
     a = raw.upper().replace("-", "").replace(" ", "")
-    return {"INDRA": "IND", "BRICKWORK": "BWR"}.get(a, a)
+    return {"INDRA": "IND", "INDIARATINGS": "IND", "BRICKWORK": "BWR"}.get(a, a)
 
 
 def find_ratings(text: str) -> list[dict]:
@@ -178,7 +184,7 @@ def _extract_impl(document: Document, jsonl_path: Path) -> CreditResult | None:
 
     chosen = _choose(text)
     if chosen is None:
-        return None
+        return _reference_only(text)
 
     all_ratings = [{k: v for k, v in r.items() if k != "pos"} for r in find_ratings(text)]
     extras: dict = {"agency": chosen["agency"]}
@@ -188,7 +194,7 @@ def _extract_impl(document: Document, jsonl_path: Path) -> CreditResult | None:
             extras["stated_direction"] = "downgrade"
         elif DIRECTION_UP.search(text):
             extras["stated_direction"] = "upgrade"
-    short = sorted({m.group("st").upper() for m in SHORT_RE.finditer(text)})
+    short = _short_term(text)
     if short:
         extras["short_term_ratings"] = short
 
@@ -200,6 +206,46 @@ def _extract_impl(document: Document, jsonl_path: Path) -> CreditResult | None:
         agency=chosen["agency"],
         extras=extras,
     )
+
+
+def _short_term(text: str) -> list[str]:
+    """Short-term symbols in the text, OCR 'l' / 'I' read back as 1 ("Al+" -> "A1+")."""
+    return sorted({re.sub(r"[lI]", "1", m.group("st")).upper() for m in SHORT_RE.finditer(text)})
+
+
+def _reference_only(text: str) -> CreditResult | None:
+    """
+    A rating letter with no long-term rating (commercial-paper ratings, fixed-deposit scale,
+    a withdrawal, or a downgrade announced without the new symbol).  Kept as reference
+    signals for later models: credit_rating and rating_outlook stay NULL, so the rating rules
+    and the rating-change post-pass ignore the row.  None when the text carries none of these.
+    """
+    extras: dict = {}
+    short = _short_term(text)
+    if short:
+        extras["short_term_ratings"] = short
+    deposit = sorted({f"{m.group('scale')}{m.group('rating')}{m.group('sign') or ''}" for m in DEPOSIT_RE.finditer(text)})
+    if deposit:
+        extras["deposit_ratings"] = deposit
+    w = WATCH_RE.search(text)
+    if w:
+        extras["watch"] = (w.group(1) or w.group(2)).capitalize()
+    if WITHDRAWN_RE.search(text):
+        extras["rating_withdrawn"] = True
+    if DIRECTION_DOWN.search(text):
+        extras["stated_direction"] = "downgrade"
+    elif DIRECTION_UP.search(text):
+        extras["stated_direction"] = "upgrade"
+    if not extras:
+        return None
+    # agency of a matched symbol; else a whole-word agency name ("IND" alone would hit "INDIA")
+    sym = SHORT_RE.search(text) or DEPOSIT_RE.search(text)
+    named = _LETTER_AGENCY.search(text)
+    extras["agency"] = (_agency_name(sym.group("agency")) if sym
+                        else _agency_name(named.group(1)) if named else None)
+    extras["reference_only"] = True
+    return CreditResult(credit_rating=None, rating_outlook=None, rating_change_flag=None,
+                        instrument_ratings=None, agency=extras["agency"], extras=extras)
 
 
 # ---------------------------------------------------------------------------

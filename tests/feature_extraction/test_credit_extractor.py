@@ -143,3 +143,54 @@ def test_annual_report_investment_ratings_are_ignored():
 
 def test_annual_report_without_rating_phrase_gives_none():
     assert extract_from_annual_report(["The Company's facilities are rated CARE A."]) is None
+
+
+# ---------------------------------------------------------------------------
+# Rating letters without a long-term rating: reference-only rows (DHFL / IDEA letters)
+# ---------------------------------------------------------------------------
+
+_SEBI = "Securities and Exchange Board of India (Listing Obligations and Disclosure Requirements) Regulations. "
+
+
+def _ref(tmp_path, text):
+    return ce.extract(SimpleNamespace(id=1), None, _jsonl(tmp_path, _SEBI + text), MagicMock())
+
+
+def test_commercial_paper_only_is_reference_row(tmp_path):
+    r = _ref(tmp_path, "CARE Ratings Limited (CARE) has assigned Commercial Paper Rs. 10,000 crore CARE A1+ Assigned")
+    assert r.credit_rating is None and r.rating_outlook is None
+    assert r.extras["short_term_ratings"] == ["A1+"] and r.extras["agency"] == "CARE"
+    assert r.extras["reference_only"] is True
+
+
+def test_ocr_short_term_symbol_and_negative_watch(tmp_path):
+    r = _ref(tmp_path, "ICRA Limited (lCRA) Commercial Paper Programme Rs. 8,000 crore ICRAA1+@, "
+                       "(Placed on watch with negative implications.)")
+    assert r.extras["short_term_ratings"] == ["A1+"] and r.extras["watch"] == "Negative"
+    r = _ref(tmp_path, "CRISIL Limited has re-affirmed Commercial Paper Rs. 15,000 crore CRISIL Al+ Re-affirmed")
+    assert r.extras["short_term_ratings"] == ["A1+"] and r.extras["agency"] == "CRISIL"
+
+
+def test_fixed_deposit_scale_is_kept_as_reference(tmp_path):
+    r = _ref(tmp_path, "Brickwork Ratings India Pvt. Ltd (Brickwork) Fixed Deposit Rs. 12,000 crore BWR FAAA Re-affirmed "
+                       "(Pronounced as BWR F Triple A) Outlook Stable")
+    assert r.credit_rating is None and r.extras["deposit_ratings"] == ["FAAA"] and r.extras["agency"] == "BWR"
+
+
+def test_withdrawal_and_downgrade_without_symbol(tmp_path):
+    r = _ref(tmp_path, "CARE Ratings Limited (CARE) Commercial Paper - - Rating Withdrawn by CARE at the request of the Company.")
+    assert r.extras["rating_withdrawn"] is True and r.extras["agency"] == "CARE"
+    r = _ref(tmp_path, "Brickwork Ratings, has downgraded its rating on Non-Convertible Debentures aggregating to Rs. 2,500 crores")
+    assert r.extras["stated_direction"] == "downgrade" and r.extras["agency"] == "BWR"
+    assert r.credit_rating is None
+
+
+def test_reference_rows_are_ignored_by_rating_rules():
+    from risk_engine.scorer import PeriodFeatureSet, evaluate_rules_v2
+    ref = SimpleNamespace(id=9, credit_rating=None, rating_outlook=None, rating_change_flag=None,
+                          additional_signals={"reference_only": True, "watch": "Negative", "stated_direction": "downgrade"})
+    fs = PeriodFeatureSet(company_id=1, fiscal_year="FY2019", fiscal_quarter="Q4", financial_features=[],
+                          governance_features=[], credit_features=[ref], shareholding_patterns=[])
+    r = evaluate_rules_v2(fs)
+    assert r.triggered_rules == []
+    assert not {"RATING_DOWNGRADE", "RATING_DEFAULT_GRADE"} & set(r.evaluated_rule_ids)

@@ -559,9 +559,10 @@ def _set_ratio(res: ParsedStatements, key: str, v: Decimal, s: dict, nbfc: bool)
     """Store a ratio as a rule input, or for lenders as reference only.
 
     Lenders' accounts do not fit the operating-company ratio rules: leverage of 6-10x is their
-    business model, interest is their main cost (coverage of 1.1-1.3x is normal) and their
-    balance sheets are not split current / non-current.  A figure the lender reports is kept
-    in additional_signals["{key}_lender"]; the rule input stays NULL (not evaluable).
+    business model, interest is their main cost (coverage of 1.1-1.3x is normal), their
+    balance sheets are not split current / non-current, and loans disbursed count as operating
+    cash outflows (a growing lender's CFO is routinely negative).  The figure is kept in
+    additional_signals["{key}_lender"]; the rule input stays NULL (not evaluable).
     """
     if nbfc:
         res.additional[f"{key}_lender"] = str(v)
@@ -607,8 +608,9 @@ def parse_statements(pages: list[str], doc_type: str, nbfc: bool) -> ParsedState
 
     cfo = _best(scans["cfo"])
     if cfo is not None:
-        res.cfo = cfo.crore()
-        res.sources["cfo"] = _src(cfo)
+        # lenders: loans disbursed and deposits taken are operating cash flows, so a growing
+        # lender's CFO is routinely negative; kept for reference only
+        _set_ratio(res, "cfo", cfo.crore(), _src(cfo), nbfc)
 
     # ----- EBITDA margin (not meaningful for lenders: interest is their cost of goods)
     pbt = _best(scans["pbt"], prefer_page=rev.page if rev else None)

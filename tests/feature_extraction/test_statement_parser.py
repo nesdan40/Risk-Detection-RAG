@@ -196,8 +196,11 @@ def test_consolidated_beats_standalone_regardless_of_page_order():
 def test_cash_flow_from_operating_activities():
     page = ("Consolidated Cash Flow Statement\n(₹ in lakh)\n"
             "Net Cash Flow (used in) Operating Activities  (A)  (2,915,399)  (1,559,319)\n")
-    r = parse_statements([page], "annual_report", nbfc=True)
+    r = parse_statements([page], "annual_report", nbfc=False)
     assert r.cfo == D("-29153.99")
+    # lender (this row is DHFL's): reference only, not the CFO_NEGATIVE input
+    r = parse_statements([page], "annual_report", nbfc=True)
+    assert r.cfo is None and r.additional["cfo_lender"] == "-29153.99"
 
 
 def test_current_ratio_computed_from_balance_sheet():
