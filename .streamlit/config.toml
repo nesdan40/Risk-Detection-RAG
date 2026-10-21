@@ -1,0 +1,13 @@
+[server]
+# Disable file-watcher scanning of third-party packages.
+# Eliminates the torchvision/transformers ModuleNotFoundError spam that
+# floods the terminal when Streamlit's watcher walks the transformers package.
+fileWatcherType = "none"
+
+[runner]
+# Add src/ to sys.path so that `from ui import ...`, `from config import ...`,
+# etc. all resolve when Streamlit runs src/ui/app.py from the project root.
+pythonPath = ["src"]
+
+[browser]
+gatherUsageStats = false

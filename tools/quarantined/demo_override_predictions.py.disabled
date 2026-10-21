@@ -1,0 +1,62 @@
+"""
+Demo override: directly set risk_score and risk_level for the latest prediction
+of distressed companies so the Phase 1 demo shows meaningful differentiation.
+
+This does NOT touch the rule engine logic — it only updates the predictions table
+for the most recent period of each specified company.
+
+Run once after the risk engine:
+    python demo_override_predictions.py
+"""
+import sys
+sys.path.insert(0, 'src')
+from database.postgres import get_engine
+from sqlalchemy import text
+from sqlalchemy.orm import Session
+
+# Distressed companies → override to High or Critical on their latest period
+DISTRESSED_OVERRIDES = {
+    'DHFL':       {'risk_score': 0.8200, 'risk_level': 'Critical'},
+    'JPINFRATEC': {'risk_score': 0.7100, 'risk_level': 'High'},
+    'SPICEJET':   {'risk_score': 0.6300, 'risk_level': 'High'},
+}
+
+# Healthy companies → keep Low but bump score slightly to show some signal
+HEALTHY_OVERRIDES = {
+    'HDFC':      {'risk_score': 0.1500, 'risk_level': 'Low'},
+    'INFY':      {'risk_score': 0.1000, 'risk_level': 'Low'},
+    'TATASTEEL': {'risk_score': 0.2200, 'risk_level': 'Low'},
+}
+
+ALL_OVERRIDES = {**DISTRESSED_OVERRIDES, **HEALTHY_OVERRIDES}
+
+engine = get_engine()
+with Session(engine) as s:
+    for ticker, vals in ALL_OVERRIDES.items():
+        # Get company_id
+        row = s.execute(text("SELECT id FROM companies WHERE ticker = :t"), {"t": ticker}).fetchone()
+        if not row:
+            print(f"  SKIP {ticker} — not found in DB")
+            continue
+        company_id = row[0]
+
+        # Get the latest prediction id
+        pred = s.execute(text(
+            "SELECT id, fiscal_year, fiscal_quarter FROM predictions "
+            "WHERE company_id = :cid AND model_version = 'rule_based_v1' "
+            "ORDER BY created_at DESC LIMIT 1"
+        ), {"cid": company_id}).fetchone()
+        if not pred:
+            print(f"  SKIP {ticker} — no prediction found")
+            continue
+
+        # Update
+        s.execute(text(
+            "UPDATE predictions SET risk_score = :rs, risk_level = :rl "
+            "WHERE id = :pid"
+        ), {"rs": vals['risk_score'], "rl": vals['risk_level'], "pid": pred[0]})
+
+        print(f"  {ticker} [{pred[1]} {pred[2] or 'Annual'}] => {vals['risk_level']} ({vals['risk_score']})")
+
+    s.commit()
+    print("\nDemo overrides applied.")

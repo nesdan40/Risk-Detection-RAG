@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+.env
+data/
+.hypothesis/
+.pytest_cache/
+*.pyc
+.DS_Store
+.kiro
+logs
