@@ -512,6 +512,18 @@ def rollup_governance(rows: list[ExtractedFeature]) -> ExtractedFeature | None:
 
 
 _SHAREHOLDING_RULES = {"PLEDGE_RISING", "PLEDGE_HIGH", "PROMOTER_HOLDING_LOW"}
+_CREDIT_RULES = {"RATING_DOWNGRADE", "RATING_DEFAULT_GRADE"}
+# financial rule -> the feature whose provenance (page, row label) locates its evidence
+_FINANCIAL_RULE_METRIC = {
+    "INTEREST_COVERAGE_LOW": "interest_coverage", "NEGATIVE_PAT": "pat",
+    "DEBT_TO_EQUITY_HIGH": "debt_to_equity", "CURRENT_RATIO_LOW": "current_ratio",
+    "CFO_NEGATIVE": "cfo", "REVENUE_DECLINING": "revenue",
+}
+# computed ratios record a page but no row label; anchor on the row they are built from
+_COMPUTED_RATIO_ANCHOR = {
+    "INTEREST_COVERAGE_LOW": "finance cost", "CURRENT_RATIO_LOW": "current assets",
+    "DEBT_TO_EQUITY_HIGH": "borrowings",
+}
 _GOVERNANCE_RULE_CATEGORIES = {
     "RESIGNATION_SPIKE": ["Resignation"],
     "DIRECTOR_CHURN": ["Resignation", "Director Change"],
@@ -553,7 +565,17 @@ def build_evidence_scopes(feature_set, triggered_rules) -> dict[str, dict]:
         if row is None:
             continue
         if row.document_id is not None:
-            scopes[rule.rule_id] = {"document_id": row.document_id}
+            scope = {"document_id": row.document_id}
+            metric = _FINANCIAL_RULE_METRIC.get(rule.rule_id)
+            if metric:
+                # the page and row label the value was extracted from (feature provenance)
+                src = (((row.additional_signals or {}).get("sources") or {}).get(metric)) or {}
+                if src.get("page") is not None:
+                    scope["page"] = src["page"]
+                    scope["label"] = src.get("label") or _COMPUTED_RATIO_ANCHOR.get(rule.rule_id)
+            elif rule.rule_id in _CREDIT_RULES and row.credit_rating:
+                scope["rating"] = row.credit_rating
+            scopes[rule.rule_id] = scope
         elif rule.rule_id in _GOVERNANCE_RULE_CATEGORIES:
             scopes[rule.rule_id] = {
                 "document_type": "corporate_announcement",

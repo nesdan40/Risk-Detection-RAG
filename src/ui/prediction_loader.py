@@ -109,6 +109,55 @@ def get_latest_prediction(company_id: int, session: Session) -> dict | None:
     }
 
 
+MODEL_VERSIONS: dict[str, str] = {
+    "rule_based_v1": "v1 · baseline (÷ all 15 rules)",
+    "rule_based_v2": "v2 · coverage-adjusted (÷ rules with data)",
+}
+
+_QUARTER_ORDER = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4, None: 5}  # annual after Q4
+
+
+def period_sort_key(prediction: dict) -> tuple:
+    """Chronological order: fiscal year, then Q1-Q4, then the annual period."""
+    return (prediction.get("fiscal_year") or "", _QUARTER_ORDER.get(prediction.get("fiscal_quarter"), 6))
+
+
+def period_label(prediction: dict) -> str:
+    """'FY2019 Q3 · High (0.556)' — period, level and score, as shown in the period picker."""
+    score = prediction.get("risk_score")
+    score_text = f"{float(score):.3f}" if score is not None else "—"
+    return (f"{prediction.get('fiscal_year')} {prediction.get('fiscal_quarter') or 'Annual'}"
+            f" · {prediction.get('risk_level') or '—'} ({score_text})")
+
+
+def get_period_predictions(company_id: int, model_version: str, session: Session) -> list[dict]:
+    """
+    Every scored period of one company for one model version, oldest first
+    (fiscal year, then Q1-Q4, then annual).  Same keys as get_latest_prediction().
+    """
+    sql = text(
+        "SELECT id, company_id, fiscal_year, fiscal_quarter, risk_score, "
+        "       risk_level, risk_flags, evidence_chunks, model_version, created_at "
+        "FROM predictions "
+        "WHERE company_id = :company_id "
+        "  AND model_version = :model_version"
+    )
+    rows = session.execute(sql, {"company_id": company_id, "model_version": model_version}).fetchall()
+    predictions = [{
+        "id":              row.id,
+        "company_id":      row.company_id,
+        "fiscal_year":     row.fiscal_year,
+        "fiscal_quarter":  row.fiscal_quarter,
+        "risk_score":      row.risk_score,
+        "risk_level":      row.risk_level,
+        "risk_flags":      row.risk_flags,
+        "evidence_chunks": row.evidence_chunks,
+        "model_version":   row.model_version,
+        "created_at":      row.created_at,
+    } for row in rows]
+    return sorted(predictions, key=period_sort_key)
+
+
 def get_extracted_features(
     company_id: int,
     fiscal_year: str,

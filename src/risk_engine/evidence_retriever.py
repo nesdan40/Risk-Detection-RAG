@@ -24,9 +24,12 @@ import sys
 from dataclasses import dataclass
 
 from qdrant_client import QdrantClient
-from qdrant_client.models import DatetimeRange, FieldCondition, Filter, MatchAny, MatchValue
+import re
+
+from qdrant_client.models import DatetimeRange, FieldCondition, Filter, MatchAny, MatchValue, Range
 from sentence_transformers import SentenceTransformer
 
+from feature_extraction.credit_extractor import rating_mentions
 from risk_engine.scorer import RuleResult
 
 # ---------------------------------------------------------------------------
@@ -110,7 +113,8 @@ class ChunkReference:
 
     Attributes:
         rule_id:        rule_id of the triggered rule this evidence supports.
-        chunk_text:     First 500 characters of the chunk's text payload.
+        chunk_text:     500 characters of the chunk's text payload: from the start, or
+                        around the value's row label / the fired rating when found.
                         None when no result found or on error.
         document_id:    PostgreSQL documents.id from the chunk payload.
                         None when no result found or on error.
@@ -144,6 +148,10 @@ class ChunkReference:
 
 # Number of chunks to retrieve per triggered rule
 EVIDENCE_TOP_K: int = 3
+# candidates fetched when looking for the chunk that holds a value's row or a letter's rating
+CANDIDATE_LIMIT: int = 20
+# characters kept before the anchored row or rating in a cited excerpt
+EXCERPT_LEAD: int = 150
 
 
 # ---------------------------------------------------------------------------
@@ -264,16 +272,30 @@ def _retrieve_single_evidence(
         if scope.get("categories"):
             scoped.append(FieldCondition(key="document_category", match=MatchAny(any=list(scope["categories"]))))
 
-    def _search(conditions):
+    def _search(conditions, limit=EVIDENCE_TOP_K):
         return qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
             query_filter=Filter(must=conditions),
-            limit=EVIDENCE_TOP_K,
+            limit=limit,
         ).points
 
     kind = "document_chunk"
-    results = _search(scoped) if len(scoped) > len(base) else []
+    results: list = []
+    anchor_at: int | None = None
+    page = scope.get("page")
+    if page is not None and scope.get("document_id") is not None:
+        # the page the value was read from: prefer the chunk that holds the row's label
+        on_page = _search(scoped + [FieldCondition(key="page_start", range=Range(lte=page)),
+                                    FieldCondition(key="page_end", range=Range(gte=page))],
+                          limit=CANDIDATE_LIMIT)
+        results, anchor_at = _pick_anchored(on_page, lambda t: _label_pos(t, scope.get("label")))
+    if not results and scope.get("rating") and scope.get("document_id") is not None:
+        # a credit letter: prefer the chunk that names the rating that fired
+        candidates = _search(scoped, limit=CANDIDATE_LIMIT)
+        results, anchor_at = _pick_anchored(candidates, lambda t: _rating_pos(t, scope["rating"]))
+    if not results:
+        results = _search(scoped) if len(scoped) > len(base) else []
     if not results:
         results = _search(base)
         kind = "company_search"
@@ -285,7 +307,7 @@ def _retrieve_single_evidence(
     raw_text: str | None = payload.get("chunk_text")
     return ChunkReference(
         rule_id=rule_result.rule_id,
-        chunk_text=raw_text[:500] if raw_text else None,
+        chunk_text=_excerpt(raw_text, anchor_at) if raw_text else None,
         document_id=payload.get("document_id"),
         file_name=payload.get("file_path"),
         fiscal_year=payload.get("fiscal_year"),
@@ -297,6 +319,43 @@ def _retrieve_single_evidence(
         page_end=payload.get("page_end"),
         source_kind=kind,
     )
+
+
+def _pick_anchored(points: list, locate) -> tuple[list, int | None]:
+    """Order points so the first one whose text the locator finds comes first.
+
+    Returns ([], None) for no points; otherwise (points reordered, anchor offset or None).
+    """
+    for i, point in enumerate(points):
+        pos = locate((point.payload or {}).get("chunk_text") or "")
+        if pos is not None:
+            return [point] + points[:i] + points[i + 1:], pos
+    return list(points), None
+
+
+def _label_pos(text: str, label: str | None) -> int | None:
+    """Offset of a statement row label in chunk text, tolerant of whitespace and case."""
+    if not label:
+        return None
+    words = label.split()
+    m = re.search(r"\s*".join(re.escape(w) for w in words), text, re.I) if words else None
+    return m.start() if m else None
+
+
+def _rating_pos(text: str, rating: str) -> int | None:
+    """Offset of an agency-qualified mention of the fired rating in chunk text."""
+    for mention in rating_mentions(text):
+        if mention["rating"] == rating:
+            return mention["pos"]
+    return None
+
+
+def _excerpt(text: str, anchor_at: int | None, size: int = 500) -> str:
+    """size characters of the chunk: from the start, or around the anchored row or rating."""
+    if anchor_at is None or anchor_at < size - EXCERPT_LEAD:
+        return text[:size]
+    start = max(0, min(anchor_at - EXCERPT_LEAD, len(text) - size))  # keep a full window near the end
+    return text[start:start + size]
 
 
 def _make_stub(rule_id: str) -> ChunkReference:

@@ -55,7 +55,7 @@ from feature_extraction.governance_extractor import (
     evaluate_agm_delay_flag,
     group_announcements_by_period,
 )
-from feature_extraction.fiscal_utils import calculate_period_end
+from feature_extraction.fiscal_utils import calculate_period_end, derive_fiscal_period
 
 # ---------------------------------------------------------------------------
 # Eligible document types
@@ -363,6 +363,15 @@ def _coerce_date(value):
     return value
 
 
+def _in_collection_window(company: Company, fiscal_year: str) -> bool:
+    """True when fiscal_year lies within the company's collection window (or no window is set)."""
+    start, end = company.collection_window_start, company.collection_window_end
+    if start is None or end is None:
+        return True
+    first, last = derive_fiscal_period(start)[0], derive_fiscal_period(end)[0]
+    return first <= fiscal_year <= last  # 'FY2015' labels compare in year order
+
+
 def _load_company_map(session: Session, company_ids: set[int]) -> dict[int, Company]:
     """Fetch Company rows for the given set of IDs."""
     if not company_ids:
@@ -620,8 +629,10 @@ def main(
                 )
 
         # Quarterly rows need the prior-year row, which may have been extracted later.
+        # Impossible annual revenue (below one of its own quarters) is rejected first.
         try:
             for cid in sorted({d.company_id for d in financial_docs if d.company_id}):
+                financial_extractor.reject_impossible_annual_revenue(session, cid)
                 financial_extractor.backfill_revenue_growth(session, cid)
             session.commit()
         except Exception as exc:  # noqa: BLE001
@@ -661,6 +672,12 @@ def main(
         for (company_id, fy, fq), period_anns in company_period_groups.items():
             company = company_map.get(company_id)
             if company is None:
+                continue
+            # An announcement dated outside the collection window would create a
+            # governance-only period with nothing else to score.
+            if not _in_collection_window(company, fy):
+                print(f"[skip] {company.ticker} {fy} {fq}: outside the collection window "
+                      f"({len(period_anns)} announcement(s))")
                 continue
 
             # Aggregate counts for this period

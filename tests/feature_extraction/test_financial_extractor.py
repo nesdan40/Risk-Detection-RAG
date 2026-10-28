@@ -138,3 +138,53 @@ def test_load_chunks_malformed_raises(tmp_path):
     p.write_text("{not json}\n", encoding="utf-8")
     with pytest.raises(ValueError):
         fe.load_chunks(p)
+
+
+# ---------------------------------------------------------------------------
+# reject_impossible_annual_revenue (an annual total below one of its own quarters)
+
+
+def _fin(fy, fq, revenue, scope="standalone", growth=None, ebitda=None, growth_how=None):
+    sources = {"revenue": {"scope": scope, "page": 2, "how": "row"}}
+    if growth_how:
+        sources["revenue_growth_pct"] = {"how": growth_how}
+    if ebitda is not None:
+        sources["ebitda_margin_pct"] = {"how": "computed (PBT + finance cost + depreciation) / revenue"}
+    return SimpleNamespace(fiscal_year=fy, fiscal_quarter=fq, revenue=revenue, revenue_growth_pct=growth,
+                           ebitda_margin_pct=ebitda, additional_signals={"sources": sources})
+
+
+def _fin_session(rows):
+    s = MagicMock()
+    s.execute.return_value.scalars.return_value.all.return_value = rows
+    return s
+
+
+def test_annual_revenue_below_a_quarter_is_rejected():
+    """Jet Airways FY2019: a garbled 'Total Income 2, ... H,411' read as Rs 0.02 crore."""
+    annual = _fin("FY2019", None, D("0.02"), growth=D("-99.51"), ebitda=D("5"),
+                  growth_how="annual statement, current vs previous year column")
+    rows = [_fin("FY2019", "Q1", D("6066.91")), _fin("FY2019", "Q2", D("6236.69")), annual]
+    assert fe.reject_impossible_annual_revenue(_fin_session(rows), 1) == 1
+    assert annual.revenue is None and annual.revenue_growth_pct is None and annual.ebitda_margin_pct is None
+    src = annual.additional_signals["sources"]
+    assert src["revenue"]["rejected_value"] == "0.02" and src["revenue"]["largest_quarter"] == "6236.69"
+    assert "revenue_growth_pct" not in src
+
+
+def test_plausible_annual_and_other_scope_quarters_are_kept():
+    """Reliance Capital FY2021: a standalone year can be smaller than a consolidated quarter."""
+    ok = _fin("FY2018", None, D("24510.69"))
+    holding = _fin("FY2021", None, D("563"))
+    rows = [_fin("FY2018", "Q4", D("6055.15")), ok,
+            _fin("FY2021", "Q1", D("4281"), scope="consolidated"), holding]
+    assert fe.reject_impossible_annual_revenue(_fin_session(rows), 1) == 0
+    assert ok.revenue == D("24510.69") and holding.revenue == D("563")
+
+
+def test_next_year_growth_from_rejected_figure_is_cleared():
+    nxt = _fin("FY2020", None, D("20000"), growth=D("999999"),
+               growth_how="vs same period prior fiscal year (database)")
+    rows = [_fin("FY2019", "Q1", D("6000")), _fin("FY2019", None, D("0.02")), nxt]
+    assert fe.reject_impossible_annual_revenue(_fin_session(rows), 1) == 2
+    assert nxt.revenue == D("20000") and nxt.revenue_growth_pct is None

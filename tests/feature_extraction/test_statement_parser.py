@@ -133,6 +133,32 @@ def test_loss_is_negative():
     assert r.pat == D("-12.5")
 
 
+def test_loss_first_net_profit_label_is_pat():
+    """Jet Q4 FY2018: 'Net (Loss)/ Profit (5+6)' was missed and an Indian GAAP
+    reconciliation row ('Net profit as per previous Indian GAAP 3 680') was read instead."""
+    page = (
+        "Amount (₹ in Lakhs)\n"
+        "Total Income  605,515  611,617  607,282  2,395,837\n"
+        "3. (Loss)/ Profit before Tax (1-2)  (103,600)  16,525  60,242  (76,762)\n"
+        "7. Net (Loss)/ Profit (5+6)  (103,600)  16,525  60,242  (76,762)\n"
+        "Net profit as per previous Indian GAAP  3 680  39 043\n"
+    )
+    r = parse_statements([page], "quarterly_result", nbfc=False)
+    assert r.pat == D("-1036.00")
+    assert r.sources["pat"]["label"].startswith("Net (Loss)/ Profit")
+
+
+def test_loss_first_net_profit_after_tax_with_ocr_serial():
+    """Jet Q3 FY2019: OCR serial 's.' pushed 'Profit after Tax' past the label window."""
+    page = (
+        "Amount (₹ in Lakhs)\n"
+        "Total Income  612,421  623,669  634,934\n"
+        "s. Net (Loss)/ Profit after Tax (3-4)  (58,777)  (129,746)  16,525\n"
+    )
+    r = parse_statements([page], "quarterly_result", nbfc=False)
+    assert r.pat == D("-587.77")
+
+
 # ---------------------------------------------------------------------------
 # Annual reports
 # ---------------------------------------------------------------------------
@@ -217,6 +243,119 @@ def test_reported_ratio_is_preferred_and_range_checked():
     assert r.debt_to_equity == D("0.45")
     assert r.current_ratio == D("1.8")
     assert r.sources["debt_to_equity"]["how"] == "reported ratio"
+
+
+def test_dotted_note_after_label_words_is_not_pat():
+    """HDFC: 'PROFIT AFTER TAX ATTRIBUTABLE TO THE CORPORATION  5.1  11,051.12 ...' -> 11,051.12, not 5.1."""
+    page = ("Consolidated Statement of Profit and Loss for the year ended March 31, 2017\n"
+            "INCOME  ` in Crore  ` in Crore\n"
+            "Revenue from Operations  26  35,005.26  31,873.34\n"
+            "PROFIT AFTER TAX ATTRIBUTABLE TO THE CORPORATION  5.1  11,051.12  10,190.26\n")
+    assert parse_statements([page], "annual_report", nbfc=True).pat == D("11051.12")
+
+
+def test_ocr_space_beside_thousands_comma():
+    """HDFC Q2 FY2019: '11 ,245.61' is one figure, not 11 and 245.61."""
+    assert row_numbers("  11 ,245.61  9,947.35  9,003.21") == [D("11245.61"), D("9947.35"), D("9003.21")]
+    assert row_numbers("  17,580.51  13, 111.21") == [D("17580.51"), D("13111.21")]
+
+
+def test_space_as_thousands_separator_in_wide_column_rows():
+    """Reliance Capital: 'Total revenue from operations  20 447  18 718' -> 20447, not a note ref 20 and 447."""
+    assert row_numbers("  20 447  18 718") == [D(20447), D(18718)]
+    assert row_numbers("  (1 454)  (4 556)") == [D(-1454), D(-4556)]
+    assert row_numbers("  28  7 677  7 263") == [D(28), D(7677), D(7263)]
+    # Reliance Capital Q4 FY2020: a space inside the loss bracket
+    assert row_numbers(" (VIII-IX)  ( 2 179)  ( 145)  ( 2 304)") == [D(-2179), D(-145), D(-2304)]
+    page = ("Consolidated statement of profit and loss for the year ended March 31, 2019\n(` in crore)\n"
+            "Total revenue from operations  20 447  18 718\nProfit for the year after tax  (1 454)  (4 556)\n")
+    r = parse_statements([page], "annual_report", nbfc=True)
+    assert (r.revenue, r.pat) == (D(20447), D(-1454))
+
+
+def test_standalone_segment_table_does_not_outrank_the_statement():
+    """Jet Q3 FY2019: the segment table's unbracketed 'Profit after Tax  58 777' was scoped
+    'unknown', which outranked the standalone statement's '(58,777)'."""
+    page = ("STATEMENT OF STANDALONE UNAUDITED FINANCIAL RESULTS FOR THE QUARTER ENDED 31ST DECEMBER, 2018\n"
+            "Amount (₹ in Lakhs)\n"
+            "Total Income  612,421  623,669  634,934\n"
+            "s. Net (Loss)/ Profit after Tax (3-4)  (58,777)  (129,746)  16,525\n"
+            "UNAUDITED STANDALONE SEGMENTWISE REVENUE, PROFIT FOR THE QUARTER ENDED 31ST DECEMBER, 2018\n"
+            "Amount (₹ in Lakhs)\n"
+            "Profit after Tax  58 777  129 746  16,525\n")
+    assert parse_statements([page], "quarterly_result", nbfc=False).pat == D("-587.77")
+
+
+def test_consolidated_segment_table_does_not_outrank_the_statement():
+    """Jet Q4 FY2018: 'Loss Profit after Tax  103 600' in a STANDALONE AND CONSOLIDATED
+    SEGMENTWISE table beat the statement's 'Net (Loss)/ Profit (5+6)  (103,600)'."""
+    stmt = ("STATEMENT OF CONSOLIDATED AUDITED FINANCIAL RESULTS FOR THE YEAR ENDED 31ST MARCH, 2018\n"
+            "Amount (₹ in Lakhs)\n"
+            "Total Income  605,515  611,617  607,282\n"
+            "7. Net (Loss)/ Profit (5+6)  (103,600)  16,525  60,242\n")
+    seg = ("AUDITED STANDALONE AND CONSOLIDATED SEGMENTWISE REVENUE, RESULTS FOR THE YEAR ENDED 31ST MARCH, 2018\n"
+           "Amount (₹ in Lakhs)\n"
+           "Loss Profit after Tax  103 600  16 525  60 242\n")
+    assert parse_statements([stmt, seg], "quarterly_result", nbfc=False).pat == D("-1036.00")
+
+
+def test_single_space_ocr_columns_are_not_joined():
+    """OCR rows separate columns by one space; '145 226' are two columns."""
+    assert row_numbers(" 162 19 145 226 205") == [D(162), D(19), D(145), D(226), D(205)]
+    # JPINFRATEC: an OCR row with one stray double space is still not space-grouped
+    assert row_numbers(" 692 672 300 2,045.  1,826") == [D(692), D(672), D(300), D(2045), D(1826)]
+
+
+def test_ocr_mangled_minus_in_formula_is_not_a_number():
+    """Jet Q3 FY2018: 'Profit before Tax (1·2)  16,525' read as PBT -1."""
+    assert row_numbers(" (1·2)  16,525  4,963  30,520") == [D(16525), D(4963), D(30520)]
+
+
+def test_reported_ratio_as_proportion():
+    """PowerGrid: 'Debt/Equity Ratio (#)  71:29  70:30' is 71/29, not 29."""
+    page = ("Physical and financial performance\n"
+            "Debt/Equity Ratio (#)  71:29  70:30  72:28  69:31  65:35\n"
+            "Current Ratio  0.36:1  0.46:1  0.41:1  0.56:1  0.92:1\n")
+    r = parse_statements([page], "annual_report", nbfc=False)
+    assert r.debt_to_equity == D("2.4483")
+    assert r.current_ratio == D("0.36")
+
+
+def test_note_and_page_reference_columns_are_skipped():
+    """Tata Steel FY2016: 'Revenue from operations  22  253  1,21,618.42  1,44,298.36' -> not 253."""
+    page = ("CONSOLIDATED STATEMENT OF PROFIT AND LOSS\nfor the year ended 31st March, 2016\n(` crore)\n"
+            "(a) Revenue from operations  22  253  1,21,618.42  1,44,298.36\n"
+            "(3) Profit before Exceptional Items and Tax  2,300.83  2,540.58\n"
+            "(f) Finance costs  26  254  4,128.64  4,847.75\n")
+    r = parse_statements([page], "annual_report", nbfc=False)
+    assert r.revenue == D("121618.42")
+    assert r.interest_coverage == D("1.5573")  # (2,300.83 + 4,128.64) / 4,128.64; page 254 is not the cost
+
+
+def test_continuing_operations_subtotal_is_not_pat():
+    """Tata Steel FY2017: the year's loss is (4,168.57), not continuing operations' (304.38)."""
+    page = ("CONSOLIDATED STATEMENT OF PROFIT AND LOSS\n(` crore)\n"
+            "X  Profit/(loss) after tax from continuing operations  (304.38)  2,042.79\n"
+            "Profit/(loss) after tax from discontinued operations  (3,864.19)  (2,539.88)\n"
+            "XII Profit/(loss) for the year (A)  (4,168.57)  (497.09)\n")
+    assert parse_statements([page], "annual_report", nbfc=False).pat == D("-4168.57")
+
+
+def test_percentage_gearing_is_not_a_debt_to_equity_ratio():
+    """Unitech FY2017: 'Net debt to equity ratio  29.15%  26.19%' is net debt / (capital + debt)."""
+    page = "Capital management\nNet debt to equity ratio  29.15%  26.19%  25.18%\n"
+    assert parse_statements([page], "annual_report", nbfc=False).debt_to_equity is None
+    # key-ratio tables add a "% change" column after the ratios
+    page = "Key financial ratios\nCurrent ratio  0.25  0.28  (10.71%)\n"
+    assert parse_statements([page], "annual_report", nbfc=False).current_ratio == D("0.25")
+
+
+def test_interest_earned_is_not_revenue_for_non_lenders():
+    """PowerGrid FY2015: a cash-flow 'Interest earned on Deposits' row was taken as revenue."""
+    page = ("Cash Flow Statement\n(` in Crore)\n"
+            "Interest earned on Deposits, Bonds and loans to State Govts.  386.03  192.89\n")
+    assert parse_statements([page], "annual_report", nbfc=False).revenue is None
+    assert parse_statements([page], "annual_report", nbfc=True).revenue == D("386.03")
 
 
 def test_empty_pages_return_all_none():

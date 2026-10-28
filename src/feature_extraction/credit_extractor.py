@@ -89,6 +89,23 @@ DEPOSIT_RE = re.compile(_AGENCY + r"[\s\-:]{0,3}(?P<scale>[FM])(?P<rating>AAA|AA
 WATCH_RE = re.compile(r"watch\s+with\s+(negative|positive|developing)\s+implications|rating\s+watch\s+(negative|positive)", re.I)
 _LETTER_AGENCY = re.compile(r"\b(ICRA|CRISIL|CARE|BRICKWORK|Brickwork|ACUITE|SMERA|INFOMERICS|India Ratings)\b")
 WITHDRAWN_RE = re.compile(r"rating\s+withdrawn|withdrawn\s+(?:the|its)\s+rating|withdrawal\s+of\s+(?:the\s+)?rating", re.I)
+# ICRA spells each symbol out: "[ICRA] A4 (pronounced ICRA A four)"; a spoken short-term
+# symbol is not a long-term "A"
+_SPOKEN_DIGIT = re.compile(r"\s+(?:one|two|three|four)\b", re.I)
+# "revised to [ICRA] B from [ICRA] BB (pronounced ICRA ...": the rating after "from", and its
+# spoken echo, are the old one
+_FROM = re.compile(r"\bfrom\s*['‘’\"“]?\s*(?:\[?\s*\w{3,6}\s*\]?\s*[A-D]{1,3}\s?[+\-]?\s*\(\s*pronounced\s*(?:as\s+)?)?$", re.I)
+# "revised the rating to BWR AA": the rating a letter says it moved *to* is the current one
+_TO = re.compile(r"\bto\s*['‘’\"“]?\s*$", re.I)
+# CARE press releases append a table of past ratings; nothing after this heading is current
+_HISTORY = re.compile(r"rating\s+history|history\s+of\s+(?:credit\s+)?ratings?", re.I)
+# Company-written announcements name the agency in the sentence, not before the symbol:
+# "CARE Ratings (CARE) has revised its rating to A+ (credit watch ...)".  Short-term "A 1", "A2" excluded.
+SENTENCE_RE = re.compile(
+    r"\b(?P<agency>CARE|ICRA|CRISIL|Brickwork|BWR|India\s+Ratings|IND-?RA|ACUITE|SMERA|INFOMERICS)\b"
+    r"[^.\n]{0,80}?\bratings?\b[^.\n]{0,40}?\b(?:to|at)\s+['‘’\"“]?"
+    r"(?P<rating>AAA|AA|A|BBB|BB|B|C|D)(?:\s?(?P<sign>[+\-]))?(?![A-Za-z0-9])(?!\s?\d)"
+)
 
 OUTLOOK_WORD = re.compile(r"\b(Stable|Negative|Positive)\s+outlook\b|\boutlook\s*(?:is|of|as)?\s*[:\-]?\s*(Stable|Negative|Positive)\b", re.I)
 REVISION_RE = re.compile(r"\b(downgrad\w*|upgrad\w*|revis\w+|lowered|revised)\b", re.I)
@@ -119,6 +136,8 @@ def find_ratings(text: str) -> list[dict]:
             sym = "D"
         if sym not in _RANK:
             continue
+        if _SPOKEN_DIGIT.match(text, m.end()):
+            continue
         out.append({
             "agency": _agency_name(m.group("agency")),
             "rating": sym,
@@ -135,12 +154,37 @@ def extract_rating_and_outlook(text: str) -> tuple[str | None, str | None]:
     return (picked["rating"], picked["outlook"]) if picked else (None, None)
 
 
+def _sentence_ratings(text: str) -> list[dict]:
+    """Ratings stated in an announcement's own words; used only when no agency-qualified symbol exists."""
+    out = []
+    for m in SENTENCE_RE.finditer(text):
+        sym = m.group("rating") + (m.group("sign") or "")
+        if sym in _RANK:
+            out.append({"agency": _agency_name(m.group("agency")), "rating": sym, "outlook": None,
+                        "pos": m.start("rating"), "context": m.group(0)[-80:].strip()})
+    return out
+
+
+def rating_mentions(text: str) -> list[dict]:
+    """Long-term rating mentions with offsets: agency-qualified symbols, else announcement sentences."""
+    return find_ratings(text) or _sentence_ratings(text)
+
+
 def _choose(text: str) -> dict | None:
-    ratings = find_ratings(text)
+    hist = _HISTORY.search(text)
+    if hist:
+        text = text[:hist.start()]
+    ratings = find_ratings(text) or _sentence_ratings(text)
     if not ratings:
         return None
     if REVISION_RE.search(text):
-        chosen = ratings[-1]            # the revised rating is listed last
+        new = [r for r in ratings if not _FROM.search(text[max(0, r["pos"] - 45): r["pos"]])]
+        if not new:
+            return None                 # only the superseded rating is legible
+        # "revised ... to X" names the new rating outright; long press releases end with tables of
+        # earlier ratings, so "listed last" is only the fallback
+        stated = [r for r in new if _TO.search(text[max(0, r["pos"] - 12): r["pos"]])]
+        chosen = stated[0] if stated else new[-1]
     else:
         chosen = max(ratings, key=lambda r: _RANK[r["rating"]])  # most conservative
     if chosen["outlook"] is None:

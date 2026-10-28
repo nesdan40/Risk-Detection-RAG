@@ -161,6 +161,73 @@ def backfill_revenue_growth(session: Session, company_id: int) -> int:
     return updated
 
 
+def _revenue_scope(row: ExtractedFeature) -> str | None:
+    return (((row.additional_signals or {}).get("sources") or {}).get("revenue") or {}).get("scope")
+
+
+def reject_impossible_annual_revenue(session: Session, company_id: int) -> int:
+    """
+    An annual total can never be smaller than one of its own quarters.  A garbled annual
+    report can still yield a tiny figure (Jet Airways FY2019: "Total Income 2, �- H,411" read
+    as Rs 0.02 crore against quarters of ~6,000 crore).  Such annual revenue, and the growth
+    and EBITDA margin computed from it, are set to NULL; the rejected value stays in the
+    provenance.  Quarters are compared only when their scope matches the annual row's, since a
+    holding company's standalone year can be smaller than a consolidated quarter.  A next-year
+    growth computed from the rejected figure is cleared too.  Returns rows changed.
+    """
+    rows = session.execute(
+        select(ExtractedFeature).where(and_(
+            ExtractedFeature.company_id == company_id,
+            ExtractedFeature.feature_type == "financial",
+        ))
+    ).scalars().all()
+    quarters: dict[str, list[tuple[Decimal, str | None]]] = {}
+    for row in rows:
+        if row.fiscal_quarter and row.revenue is not None:
+            quarters.setdefault(row.fiscal_year, []).append((Decimal(str(row.revenue)), _revenue_scope(row)))
+
+    rejected_years: set[str] = set()
+    changed = 0
+    for row in rows:
+        if row.fiscal_quarter is not None or row.revenue is None:
+            continue
+        scope = _revenue_scope(row)
+        same_scope = [v for v, s in quarters.get(row.fiscal_year, []) if s == scope]
+        if not same_scope or Decimal(str(row.revenue)) >= max(same_scope):
+            continue
+        extra = dict(row.additional_signals or {})
+        sources = dict(extra.get("sources") or {})
+        sources["revenue"] = {**(sources.get("revenue") or {}),
+                              "how": "rejected: annual revenue below a quarter of the same year",
+                              "rejected_value": str(row.revenue), "largest_quarter": str(max(same_scope))}
+        sources.pop("revenue_growth_pct", None)
+        row.revenue = None
+        row.revenue_growth_pct = None
+        if "revenue" in ((sources.get("ebitda_margin_pct") or {}).get("how") or ""):
+            sources.pop("ebitda_margin_pct", None)
+            row.ebitda_margin_pct = None
+        extra["sources"] = sources
+        row.additional_signals = extra
+        rejected_years.add(row.fiscal_year)
+        changed += 1
+
+    # the next year's growth, when it was computed from the rejected annual figure
+    for row in rows:
+        if row.fiscal_quarter is not None or row.revenue_growth_pct is None:
+            continue
+        try:
+            prior_fy = f"FY{int(row.fiscal_year[2:]) - 1}"
+        except (ValueError, IndexError, TypeError):
+            continue
+        sources = dict((row.additional_signals or {}).get("sources") or {})
+        if prior_fy in rejected_years and "database" in ((sources.get("revenue_growth_pct") or {}).get("how") or ""):
+            sources.pop("revenue_growth_pct", None)
+            row.revenue_growth_pct = None
+            row.additional_signals = {**(row.additional_signals or {}), "sources": sources}
+            changed += 1
+    return changed
+
+
 def extract(
     document: Document,
     company: Company,

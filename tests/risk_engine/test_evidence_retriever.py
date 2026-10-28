@@ -300,3 +300,62 @@ class TestQueryPrefixUsage:
         called_text = mock_model.encode.call_args[0][0]
         assert called_text.startswith(QUERY_PREFIX)
         assert "some unusual signal" in called_text
+
+
+# ---------------------------------------------------------------------------
+# Evidence located by the value's provenance (page + row label) or the fired rating
+# ---------------------------------------------------------------------------
+
+
+def _point(text, page=2, document_id=703, score=0.5):
+    p = _make_mock_qdrant_point(chunk_text=text, document_id=document_id, score=score)
+    p.payload.update({"page_start": page, "page_end": page})
+    p.id = f"pt-{page}-{score}"
+    return p
+
+
+def _client_returning(*batches):
+    client = MagicMock()
+    client.query_points.side_effect = [MagicMock(points=list(b)) for b in batches]
+    return client
+
+
+def _model():
+    m = MagicMock()
+    m.encode.return_value = MagicMock(tolist=lambda: [0.1] * 768)
+    return m
+
+
+class TestProvenanceEvidence:
+    def test_value_page_chunk_with_the_row_label_is_cited_and_centred(self):
+        """Reliance Capital: REVENUE_DECLINING cited a subsidiary note instead of the revenue row."""
+        filler = "Notes on subsidiaries and other matters. " * 30
+        row = filler + "Total Revenue from operations  3 780  4 591  5 518  18 323  20 447"
+        client = _client_returning([_point("Segment results only", score=0.9), _point(row, score=0.6)])
+        ref = _retrieve_single_evidence(
+            rule_result=_make_rule_result("REVENUE_DECLINING"), company_id=1, qdrant_client=client,
+            embedding_model=_model(),
+            scope={"document_id": 703, "page": 2, "label": "Total Revenue from operations"})
+        assert "Total Revenue from operations  3 780" in ref.chunk_text
+        assert len(ref.chunk_text) == 500
+        assert ref.source_kind == "document_chunk"
+        page_filter = client.query_points.call_args_list[0].kwargs["query_filter"].must
+        assert {c.key for c in page_filter} >= {"document_id", "page_start", "page_end"}
+
+    def test_no_chunk_on_the_value_page_falls_back_to_the_document(self):
+        client = _client_returning([], [_point("Net loss for the year", page=5)])
+        ref = _retrieve_single_evidence(
+            rule_result=_make_rule_result("NEGATIVE_PAT"), company_id=1, qdrant_client=client,
+            embedding_model=_model(), scope={"document_id": 703, "page": 2, "label": "Profit after tax"})
+        assert ref.chunk_text == "Net loss for the year" and ref.page_start == 5
+
+    def test_credit_letter_chunk_naming_the_fired_rating_is_cited(self):
+        """A letter's best semantic match may not name the rating at all."""
+        client = _client_returning([
+            _point("The rating action reflects the delay in debt servicing.", score=0.9),
+            _point("Long Term debt 'CARE D' Revised from 'CARE BB; Stable'", score=0.7),
+        ])
+        ref = _retrieve_single_evidence(
+            rule_result=_make_rule_result("RATING_DEFAULT_GRADE"), company_id=1, qdrant_client=client,
+            embedding_model=_model(), scope={"document_id": 703, "rating": "D"})
+        assert "CARE D" in ref.chunk_text

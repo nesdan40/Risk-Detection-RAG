@@ -41,7 +41,8 @@ _NUM_RE = re.compile(r"(?<![\w.])\(?\s?-?\d[\d,]*(?:\.\d+)?\s?\)?(?![\w])")
 _LEADING_SERIAL = re.compile(r"^[\s|.\-:;]*(?:\(?[ivx]{1,4}\)|\(?[a-z]\)|\d{1,2}[.)]?(?=\s*\|?\s+[A-Za-z]))[\s|.\-:;]*", re.I)
 _YEARISH = re.compile(r"^(?:19|20)\d{2}$")
 # "(3-4)", "(1+2)", "(X+XI)": column-formula hints printed next to labels
-_FORMULA_RE = re.compile(r"\(\s*[A-Za-z0-9]{1,4}(?:\s*[+\-–−]\s*[A-Za-z0-9]{1,4})+\s*\)")
+# (OCR renders the minus as a middle dot: "(1·2)")
+_FORMULA_RE = re.compile(r"\(\s*[A-Za-z0-9]{1,4}(?:\s*[+\-–−·]\s*[A-Za-z0-9]{1,4})+\s*\)")
 # bank results write it as bracketed row numbers joined by operators: "(12)-(13)", "(7)-(8)-(9)",
 # "(3)·{6)"; read naively, "(12)" is a negative number
 _CHAINED_FORMULA_RE = re.compile(r"[({]\s*[A-Za-z0-9]{1,4}\s*[)}](?:\s*[+\-–−·]\s*[({]\s*[A-Za-z0-9]{1,4}\s*[)}])+")
@@ -51,6 +52,25 @@ _OCR_FORMULA_RE = re.compile(r"(?<![\d,.])[\[({1lI|]?\d{1,2}[+\-–−][0-9B]{1,
 # also print comma-grouped figures, where a three-decimal value is otherwise implausible
 _COMMA_GROUPED = re.compile(r"\d{1,3}(?:,\d{2,3})+")
 _POINT_AS_COMMA = re.compile(r"(?<![\d.,])(\d{1,3})\.(\d{3})(?![\d.,])")
+# OCR puts a space beside a thousands comma ("11 ,245.61", "13, 111.21"), splitting one figure in two
+_SPACED_COMMA = re.compile(r"(\d)(?: ,|, | , )(\d{3})(?!\d)")
+# Typeset statements group thousands with a space ("20 447  18 718", "(1 454)").  Only read so on
+# rows whose columns are 2+ spaces apart; OCR rows separate columns by one space ("162 19 145 226").
+_WIDE_COLUMNS = re.compile(r"[\d)]\s{2,}[(\-]?\s?\d")  # also "( 2 179)"
+_SPACE_GROUPED = re.compile(r"(?<![\d,.])(\d{1,3})((?: \d{3})+)(?![\d,])")
+# a single-space gap between two figures; in a space-grouped row each one is "1-3 digits | 3 digits"
+_SINGLE_GAP = re.compile(r"(?<!\S)(\S*\d) (?=(\d\S*))")
+_GROUP_LEFT = re.compile(r"\(?\d{1,3}")
+_GROUP_RIGHT = re.compile(r"\d{3}(?:\.\d+)?[)}\]]?")
+
+
+def _space_grouped(text: str) -> bool:
+    """Row printed with space thousands separators: wide column gaps, and every single-space
+    gap between figures splits a thousands group.  An OCR row ("692 672 300 2,045.") is not."""
+    if not _WIDE_COLUMNS.search(text):
+        return False
+    return all(_GROUP_LEFT.fullmatch(m.group(1)) and _GROUP_RIGHT.fullmatch(m.group(2))
+               for m in _SINGLE_GAP.finditer(text))
 # footnote marker glued to the label: "Profit after tax(1)"
 _FOOTNOTE_RE = re.compile(r"(?<=[A-Za-z])(?:\(\d{1,2}\))+")
 # Ind AS note reference in its own column: "2.18", "2.3.1"
@@ -79,6 +99,9 @@ def row_numbers(text: str) -> list[Decimal]:
     text = _FORMULA_RE.sub(" ", text)
     text = _OCR_FORMULA_RE.sub(" ", text)
     text = _FOOTNOTE_RE.sub("", text)
+    text = _SPACED_COMMA.sub(r"\1,\2", text)
+    if _space_grouped(text):
+        text = _SPACE_GROUPED.sub(lambda m: m.group(1) + m.group(2).replace(" ", ","), text)
     if _COMMA_GROUPED.search(text):
         text = _POINT_AS_COMMA.sub(r"\1,\2", text)
     out = []
@@ -145,6 +168,9 @@ def find_unit(lines: list[str], idx: int, lookback: int = 70) -> tuple[str | Non
 
 # Optional "/(loss)" that follows "profit" in "Profit/(Loss) for the year" style labels.
 _LOSS = r"(?:\s*/?\s*\(?\s*loss\s*\)?)?"
+# "Net profit", also loss-first: "Net (Loss)/ Profit (5+6)"
+_NET_PROFIT = r"net\s+(?:\(\s*loss\s*\)\s*/\s*)?profit"
+_NOT_SEGMENT_OPS = r"(?!\s+from\s+(?:continuing|discontinued))"
 
 # Each metric: ordered list of regexes (earlier = preferred).
 LABELS: dict[str, list[re.Pattern]] = {
@@ -157,12 +183,16 @@ LABELS: dict[str, list[re.Pattern]] = {
         r"total\s+income",
     )],
     "pat": [re.compile(p, re.I) for p in (
-        r"net\s+profit" + _LOSS + r"\s*after\s+(?:tax|taxes)(?:\s+and\s+minority\s+interest)?",
-        r"profit" + _LOSS + r"\s*after\s+(?:tax|taxes)",
-        r"net\s+profit" + _LOSS + r"\s*for\s+the\s+(?:period|year|quarter)",
+        # "Net (Loss)/ Profit (5+6)  (103,600)": the statement's own bottom line; outranks a
+        # segment table's "Profit after Tax" row that lost its loss brackets
+        r"net\s+\(\s*loss\s*\)\s*/\s*profit(?=\s*(?:\(\s*\d|[\d(\-]))",
+        # not "after tax from continuing operations": a subtotal above the year's bottom line
+        _NET_PROFIT + _LOSS + r"\s*after\s+(?:tax|taxes)(?:\s+and\s+minority\s+interest)?" + _NOT_SEGMENT_OPS,
+        r"profit" + _LOSS + r"\s*after\s+(?:tax|taxes)" + _NOT_SEGMENT_OPS,
+        _NET_PROFIT + _LOSS + r"\s*for\s+the\s+(?:period|year|quarter)",
         r"profit" + _LOSS + r"\s*for\s+the\s+(?:period|year|quarter)(?!\s+before)",
         r"net\s+profit\s*/\s*\(\s*loss\s*\)",
-        r"net\s+profit(?!\s+before)",
+        _NET_PROFIT + r"(?!\s+before)",
     )],
     "pbt": [re.compile(p, re.I) for p in (
         r"profit" + _LOSS + r"\s*before\s+(?:exceptional\s+items\s+and\s+)?tax",
@@ -219,6 +249,8 @@ RATIO_LABELS = {
     "interest_coverage": (re.compile(r"interest\s+(?:service\s+)?coverage\s+ratio|interest\s+cover(?:age)?(?:\s+ratio)?", re.I), Decimal("-100"), Decimal("1000")),
     "current_ratio": (re.compile(r"current\s+ratio(?:\s*\(times\))?", re.I), Decimal("0"), Decimal("50")),
 }
+
+_PROPORTION = re.compile(r"(?<![\d.])(\d+(?:\.\d+)?)\s*:\s*(\d+(?:\.\d+)?)(?![\d.])")
 
 _SCOPE_RE = re.compile(r"\b(consolidated|standalone|stand[-\s]alone)\b", re.I)
 _SCOPE_CONTEXT = re.compile(
@@ -297,6 +329,11 @@ def _scope_at(lines: list[str], li: int) -> str:
             m = _SCOPE_RE.search(raw)
             if m:
                 return "consolidated" if m.group(1).lower() == "consolidated" else "standalone"
+    # a long results page: the statement heading sits further up the page
+    for i in range(max(li - 45, -1), -1, -1):
+        m = _SCOPE_CONTEXT.search(lines[i]) if len(lines[i]) < 140 else None
+        if m:
+            return "consolidated" if m.group(0).lower().startswith("consolidated") else "standalone"
     return "unknown"
 
 
@@ -356,10 +393,17 @@ def _scan(pages: list[str], metric: str, min_numbers: int, annual: bool) -> list
                     nxt = lines[li + 1]
                     if not re.search(r"[A-Za-z]{3,}", nxt):
                         nums = row_numbers(nxt)
-                first_tok = tail.split()[0] if tail.split() else ""
+                # first figure after the label, past any label words ("PROFIT AFTER TAX ATTRIBUTABLE ... 5.1")
+                first_tok = next((t for t in tail.split() if any(ch.isdigit() for ch in t)), "")
                 if (annual and len(nums) >= 3 and abs(nums[0]) < 100
                         and nums[0] == nums[0].to_integral_value() and "," not in first_tok):
                     nums = nums[1:]  # note-reference column ("Revenue from operations 25 1,23,456 1,10,000")
+                    # and a page-reference column ("Revenue from operations  22  253  1,21,618.42"): a bare
+                    # integer before figures far larger, or before figures printed with decimals
+                    if (len(nums) >= 3 and 0 < abs(nums[0]) < 1000 and nums[0].as_tuple().exponent == 0
+                            and (abs(nums[1]) >= 100 * abs(nums[0])
+                                 or (nums[1].as_tuple().exponent < 0 and nums[2].as_tuple().exponent < 0))):
+                        nums = nums[1:]
                 elif (annual and len(nums) >= 3 and _DOTTED_NOTE.match(first_tok)
                         and abs(nums[1]) >= 100 * abs(nums[0])):
                     nums = nums[1:]  # dotted note ref ("Revenue from operations  2.18  68,484  62,441")
@@ -439,7 +483,18 @@ def _ratio(pages: list[str], key: str) -> tuple[Decimal | None, dict | None]:
                 continue
             # a ratio table row carries current and previous year; one number is prose
             # ("... a debt service coverage ratio of 1.25. The Company ...")
-            nums = [n for n in row_numbers(line[m.end():]) if lo <= n <= hi]
+            tail = line[m.end():]
+            if re.match(r"[^\d]*\d[\d,.]*\s?%", tail):
+                continue  # a percentage ("Net debt to equity ratio  29.15%") is gearing, not times
+                          # (a trailing "% change" column, as in key-ratio tables, is fine)
+            pairs = _PROPORTION.findall(tail)
+            if pairs:
+                # proportions: "Debt/Equity Ratio  71:29  70:30", "Current Ratio  0.36:1"
+                nums = [(Decimal(a) / Decimal(b)).quantize(Decimal("0.0001"))
+                        for a, b in pairs if Decimal(b) != 0]
+                nums = [n for n in nums if lo <= n <= hi]
+            else:
+                nums = [n for n in row_numbers(tail) if lo <= n <= hi]
             if len(nums) >= 2:
                 cand = (pno, nums[0], m.group(0).strip())
                 if best is None:
@@ -468,9 +523,12 @@ def _computed_debt_to_equity(pages: list[str]) -> tuple[Decimal | None, dict | N
     def on_bs(metric: str) -> list[Candidate]:
         return [c for c in _scan(pages, metric, 2, True) if c.page in bs_pages]
 
-    options: list[tuple[Candidate, Decimal, str]] = [(c, c.value, "total equity") for c in on_bs("equity")]
+    totals = on_bs("equity")
+    options: list[tuple[Candidate, Decimal, str]] = [(c, c.value, "total equity") for c in totals]
     reserves = on_bs("reserves")
     for cap in on_bs("share_capital"):
+        if any(t.page == cap.page and t.scope == cap.scope for t in totals):
+            continue  # the statement prints its own total (a negative one means no meaningful ratio)
         # equal column counts: a dotted note ref ("Equity share capital  2.11  2,170  1,088") adds a column
         res = next((r for r in reserves if r.page == cap.page and r.scope == cap.scope and r.line > cap.line
                     and r.n_numbers == cap.n_numbers), None)
@@ -585,6 +643,9 @@ def parse_statements(pages: list[str], doc_type: str, nbfc: bool) -> ParsedState
 
     # Revenue is never negative; a negative first column is an OCR misread of a digit.
     scans["revenue"] = [c for c in scans["revenue"] if c.value is None or c.value > 0]
+    # "Interest earned" is a bank's top line; elsewhere it is a cash-flow or note row
+    if not nbfc:
+        scans["revenue"] = [c for c in scans["revenue"] if not c.matched.lower().startswith("interest")]
     # Finance cost is an expense; its sign is presentation only: "(6,027.20)" when expenses
     # are bracketed, or a stray OCR bracket ("27,164)").  Use the magnitude.
     for c in scans["finance_cost"]:
@@ -650,7 +711,8 @@ def parse_statements(pages: list[str], doc_type: str, nbfc: bool) -> ParsedState
             cl = _scan(pages, "current_liabilities", 2, True)
             ca_b = _best(ca, need_unit=False)
             cl_b = _best(cl, prefer_page=ca_b.page if ca_b else None, need_unit=False)
-            if ca_b and cl_b and cl_b.value:
+            _, lo, hi = RATIO_LABELS["current_ratio"]
+            if ca_b and cl_b and cl_b.value and lo <= ca_b.value / cl_b.value <= hi:
                 v = (ca_b.value / cl_b.value).quantize(Decimal("0.0001"))
                 s = {"how": "computed total current assets / total current liabilities",
                      "page": ca_b.page, "scope": ca_b.scope}

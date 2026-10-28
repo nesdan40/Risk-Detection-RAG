@@ -555,3 +555,31 @@ def test_invalid_prompt_raises_value_error_before_http(invalid_prompt):
         with pytest.raises(ValueError):
             generate(invalid_prompt)
         mock_post.assert_not_called()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Period picker: chronological order and labels; evidence page ranges
+# ─────────────────────────────────────────────────────────────────────────────
+
+def test_periods_sort_chronologically_with_annual_after_q4():
+    from ui.prediction_loader import period_sort_key
+    preds = [{"fiscal_year": "FY2019", "fiscal_quarter": None}, {"fiscal_year": "FY2019", "fiscal_quarter": "Q3"},
+             {"fiscal_year": "FY2018", "fiscal_quarter": "Q4"}, {"fiscal_year": "FY2019", "fiscal_quarter": "Q1"}]
+    ordered = [(p["fiscal_year"], p["fiscal_quarter"]) for p in sorted(preds, key=period_sort_key)]
+    assert ordered == [("FY2018", "Q4"), ("FY2019", "Q1"), ("FY2019", "Q3"), ("FY2019", None)]
+
+
+def test_period_label_shows_period_level_and_score():
+    from decimal import Decimal
+    from ui.prediction_loader import period_label
+    assert period_label({"fiscal_year": "FY2019", "fiscal_quarter": "Q3", "risk_level": "High",
+                         "risk_score": Decimal("0.5556")}) == "FY2019 Q3 · High (0.556)"
+    assert period_label({"fiscal_year": "FY2019", "fiscal_quarter": None, "risk_level": "Low",
+                         "risk_score": None}) == "FY2019 Annual · Low (—)"
+
+
+def test_page_range_caption():
+    from ui.app import _page_range
+    assert _page_range(None, None) == ""
+    assert _page_range(4, 4) == " | p. 4"
+    assert _page_range(4, 5) == " | pp. 4–5"

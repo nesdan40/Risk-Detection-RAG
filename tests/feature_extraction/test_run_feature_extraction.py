@@ -1051,3 +1051,20 @@ class TestIdempotencyNoNewDocs:
         with _mock_run(candidates=[]) as ctx:
             main()
         ctx.mocks["log_started"].assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# Collection window: out-of-window announcements create no governance period
+# ---------------------------------------------------------------------------
+
+
+def test_in_collection_window_by_fiscal_year():
+    """UNITECH (FY2015-FY2017): an announcement in FY2018 Q3 created an empty scored period."""
+    from types import SimpleNamespace
+    company = SimpleNamespace(collection_window_start=date(2014, 4, 1), collection_window_end=date(2017, 3, 31))
+    assert orchestrator._in_collection_window(company, "FY2015")
+    assert orchestrator._in_collection_window(company, "FY2017")
+    assert not orchestrator._in_collection_window(company, "FY2014")
+    assert not orchestrator._in_collection_window(company, "FY2018")
+    no_window = SimpleNamespace(collection_window_start=None, collection_window_end=None)
+    assert orchestrator._in_collection_window(no_window, "FY2030")

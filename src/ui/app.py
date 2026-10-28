@@ -17,7 +17,7 @@ import os
 import streamlit as st
 
 from ui import ollama_client, rag_query
-from ui.prediction_loader import get_companies, get_latest_prediction
+from ui.prediction_loader import MODEL_VERSIONS, get_companies, get_period_predictions, period_label
 
 # ── Rule-weight constants (defined independently — NOT imported from risk_engine
 #    or prediction_loader — to keep this rendering module self-contained) ──────
@@ -178,6 +178,38 @@ def render_company_selector(companies: list[dict]) -> dict | None:
     return companies[selected_index]
 
 
+def render_period_selector(company_id: int, session) -> dict | None:
+    """
+    Choose the scoring model (v1 / v2) and one scored period of the company.
+
+    Defaults to v1 and the latest period; the company's highest-scoring period
+    under the chosen model is named underneath.  Returns the chosen prediction
+    dict (same keys as ``prediction_loader.get_period_predictions``), or None.
+    """
+    model_version = st.radio(
+        "Scoring model",
+        options=list(MODEL_VERSIONS),
+        format_func=MODEL_VERSIONS.get,
+        horizontal=True,
+        key=f"model_{company_id}",
+    )
+    predictions = get_period_predictions(company_id, model_version, session)
+    if not predictions:
+        return None
+
+    labels = [period_label(p) for p in predictions]
+    index = st.selectbox(
+        "Period",
+        options=range(len(predictions)),
+        index=len(predictions) - 1,
+        format_func=lambda i: labels[i],
+        key=f"period_{company_id}_{model_version}",
+    )
+    highest = max(predictions, key=lambda p: float(p.get("risk_score") or 0))
+    st.caption(f"Highest-scoring period for this model: {period_label(highest)}")
+    return predictions[index]
+
+
 # ── Risk Report View — stub ───────────────────────────────────────────────────
 
 
@@ -293,7 +325,11 @@ def render_evidence_view(prediction: dict) -> None:
             col2.write(f"**Threshold:** {flag.get('threshold')}")
 
             chunk = chunk_by_rule.get(rule_id)
-            if chunk is None or chunk.get("chunk_text") is None:
+            if chunk is not None and chunk.get("source_kind") == "shareholding_pattern":
+                # shareholding is entered manually from exchange filings; there is no PDF passage
+                st.write(chunk.get("source_note") or "Shareholding pattern (manually entered).")
+                st.caption("Source: quarterly shareholding pattern (metadata.json)")
+            elif chunk is None or chunk.get("chunk_text") is None:
                 st.caption("No source chunk retrieved for this rule.")
             else:
                 chunk_text = chunk["chunk_text"]
@@ -306,10 +342,22 @@ def render_evidence_view(prediction: dict) -> None:
                 fq_display = fq if fq is not None else "Annual"
                 raw_file_name = chunk.get("file_name") or ""
                 base_name = os.path.basename(raw_file_name) if raw_file_name else "—"
+                pages = _page_range(chunk.get("page_start"), chunk.get("page_end"))
 
                 st.caption(
-                    f"Source: {doc_type} | {fy} {fq_display} | {base_name}"
+                    f"Source: {doc_type} | {fy} {fq_display} | {base_name}{pages}"
                 )
+                if chunk.get("source_kind") == "company_search":
+                    st.caption("Found by a company-wide search: the rule's own source document had no matching passage.")
+
+
+def _page_range(start, end) -> str:
+    """' | p. 4' or ' | pp. 4–5' for a cited chunk; empty when pages are unknown."""
+    if start is None:
+        return ""
+    if end is None or end == start:
+        return f" | p. {start}"
+    return f" | pp. {start}–{end}"
 
 
 # ── Ad-Hoc Query Box — stub ───────────────────────────────────────────────────
@@ -449,7 +497,7 @@ def main() -> None:
                 company_id = selected["id"]
                 ticker = selected["ticker"]
 
-                prediction = get_latest_prediction(company_id, session)
+                prediction = render_period_selector(company_id, session)
 
                 if prediction is None:
                     st.info(

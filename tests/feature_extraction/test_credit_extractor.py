@@ -40,6 +40,69 @@ def test_revision_language_picks_the_new_rating():
     assert outlook == "Watch"
 
 
+def test_icra_spoken_short_term_echo_is_not_a_long_term_rating():
+    """Jet Airways: '[ICRA] A3 (pronounced ICRA A three)' was read as long-term A."""
+    text = "The short term rating has been re-affirmed at [ICRA] A3 (pronounced ICRA A three)."
+    assert ce.find_ratings(text) == []
+    assert ce.extract_rating_and_outlook(text) == (None, None)
+
+
+def test_revised_to_x_from_y_picks_x():
+    """Jet Airways: ICRA writes the new rating first, the old one after 'from'."""
+    text = ("The long term rating has been revised to [ICRA] C (pronounced ICRA C) from [ICRA] B "
+            "(pronounced ICRA B) (negative outlook). The short term rating has been reaffirmed "
+            "at [ICRA] A4 (pronounced ICRA A four).")
+    assert [r["rating"] for r in ce.find_ratings(text)] == ["C", "C", "B", "B"]
+    assert ce.extract_rating_and_outlook(text)[0] == "C"
+
+
+def test_spoken_echo_stands_in_for_ocr_damaged_new_rating():
+    """Jet Airways: '[lCRA] B' is unreadable, its spoken echo 'ICRA B' is not."""
+    text = ("revised to [lCRA] B (pronounced ICRA B) (negative outlook) from [ICRA] BB "
+            "(pronounced ICRA B) and reaffirmed at [ICRA] A4 (pronounced ICRA A four).")
+    assert ce.extract_rating_and_outlook(text)[0] == "B"
+
+
+def test_only_the_superseded_rating_legible_gives_no_rating():
+    text = "revised to [lCRA] BB+ (pronounced ICRA double B plus) from [ICRA] BBB- (pronounced ICRA triple B minus)"
+    assert ce.extract_rating_and_outlook(text) == (None, None)
+
+
+def test_rating_stated_after_to_beats_a_trailing_instrument_table():
+    """Tata Steel: BWR's letter ends with an instrument table that lists 'May 2012 BWR AA+ (Stable)'."""
+    text = ("Brickwork has on 31st October, 2016 revised Tata Steel Limited's credit rating to BWR AA "
+            "from BWR AA+ for NCD and BWR AA- from BWR AA for the perpetual debt. "
+            "Instrument Issue Date Earlier Rating Rating action Rs. 3000 BWR AA Unsecured NCD "
+            "Downgraded May 2012 BWR AA+ (Stable)")
+    assert ce.extract_rating_and_outlook(text)[0] == "AA"
+
+
+def test_rating_history_annex_is_ignored():
+    """Reliance Capital: CARE's press release ends with a table of past ratings (CARE A, AA+)."""
+    text = ("Long Term debt ‘CARE D’ Revised from ‘CARE BB; Stable’. "
+            "Rating History for last three years: Please refer Annexure. "
+            "1)CARE BB; 1) CARE A+ 1)CARE AA+ (18-May-19) 4)CARE A (Under Credit watch)")
+    assert ce.extract_rating_and_outlook(text)[0] == "D"
+
+
+@pytest.mark.parametrize("text,expected", [
+    ("CARE Ratings (CARE) has revised its rating to A+ (credit watch with developing implications)", "A+"),
+    ("Brickwork Ratings has revised rating to AA for long-term debt programme", "AA"),
+    ("CARE Ratings (CARE) has reaffirmed the rating at BBB and revised the outlook", "BBB"),
+])
+def test_announcement_sentence_rating(text, expected):
+    """Reliance Capital: company-written disclosures name the agency in the sentence."""
+    assert ce.extract_rating_and_outlook(text)[0] == expected
+
+
+@pytest.mark.parametrize("text", [
+    "ICRA Limited (ICRA) has revised its rating by one notch to A 1 (A one) for commercial paper",
+    "ICRA Limited (ICRA) has revised its rating to A4 (On rating watch with negative implications)",
+])
+def test_announcement_short_term_rating_is_not_long_term(text):
+    assert ce.extract_rating_and_outlook(text) == (None, None)
+
+
 def test_without_revision_the_most_conservative_rating_wins():
     assert ce.extract_rating_and_outlook("CARE AAA and ICRA AA+ and CRISIL AA-")[0] == "AA-"
 

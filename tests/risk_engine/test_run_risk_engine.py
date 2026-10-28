@@ -1051,3 +1051,28 @@ class TestIntegrationFullPipeline:
                     )
         finally:
             _cleanup_company(pg_engine, cid)
+
+
+# ---------------------------------------------------------------------------
+# build_evidence_scopes: provenance that locates each flag's evidence
+# ---------------------------------------------------------------------------
+
+
+def test_evidence_scope_carries_value_page_label_and_rating():
+    from types import SimpleNamespace
+    from risk_engine.run_risk_engine import build_evidence_scopes
+
+    fin = SimpleNamespace(id=1, document_id=10, fiscal_year="FY2020", fiscal_quarter="Q4", additional_signals={
+        "sources": {"pat": {"page": 2, "label": "Profit/(loss) for the period"},
+                    "interest_coverage": {"page": 2, "how": "computed (PBT + finance cost) / finance cost"}}})
+    cred = SimpleNamespace(id=2, document_id=11, fiscal_year="FY2020", fiscal_quarter="Q2",
+                           credit_rating="D", additional_signals={})
+    fs = SimpleNamespace(financial_features=[fin], governance_features=[], credit_features=[cred],
+                         shareholding_patterns=[])
+    rules = [SimpleNamespace(rule_id="NEGATIVE_PAT", feature_row_id=1),
+             SimpleNamespace(rule_id="INTEREST_COVERAGE_LOW", feature_row_id=1),
+             SimpleNamespace(rule_id="RATING_DEFAULT_GRADE", feature_row_id=2)]
+    scopes = build_evidence_scopes(fs, rules)
+    assert scopes["NEGATIVE_PAT"] == {"document_id": 10, "page": 2, "label": "Profit/(loss) for the period"}
+    assert scopes["INTEREST_COVERAGE_LOW"] == {"document_id": 10, "page": 2, "label": "finance cost"}
+    assert scopes["RATING_DEFAULT_GRADE"] == {"document_id": 11, "rating": "D"}
